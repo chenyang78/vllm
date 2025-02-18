@@ -8,9 +8,10 @@ import torch
 import triton
 import triton.language as tl
 
-from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadata, AttentionType)
-from vllm.attention.backends.utils import get_flash_attn_version
+from vllm.attention.backends.abstract import (
+    AttentionBackend, AttentionImpl, AttentionMetadata, AttentionType)
+from vllm.attention.backends.utils import (
+    CommonAttentionState, get_flash_attn_version)
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import cdiv
@@ -40,6 +41,10 @@ class FlashAttentionBackend(AttentionBackend):
     @staticmethod
     def get_metadata_cls() -> Type["AttentionMetadata"]:
         return FlashAttentionMetadata
+
+    @staticmethod
+    def get_state_cls() -> Type["CommonAttentionState"]:
+        return CommonAttentionState
 
     @staticmethod
     def get_kv_cache_shape(
