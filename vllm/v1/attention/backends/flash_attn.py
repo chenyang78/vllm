@@ -119,7 +119,7 @@ class FlashAttentionMetadataBuilder:
         if use_cascade:
             # TODO: Optimize.
             cu_prefix_query_lens = torch.tensor(
-                [0, total_num_scheduled_tokens],
+                [0, num_actual_tokens],
                 dtype=torch.int32,
                 device=self.runner.device)
             prefix_kv_lens = torch.tensor([common_prefix_len],
@@ -148,7 +148,7 @@ class FlashAttentionMetadataBuilder:
             prefix_kv_lens=prefix_kv_lens,
             suffix_kv_lens=suffix_kv_lens,
         )
-        return attn_meta
+        return attn_metadata
 
 
 class FlashAttentionImpl(AttentionImpl):

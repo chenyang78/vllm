@@ -332,13 +332,16 @@ class InputBatch:
         self.logit_bias[req_index] = None
         return req_index
 
-    def swap_states(self, i1: str, i2: str) -> None:
-        self._req_ids[i1], self._req_ids[i2] =\ 
+    def swap_states(self, i1: int, i2: int) -> None:
+        old_id_i1 = self._req_ids[i1]
+        old_id_i2 = self._req_ids[i2]
+        self._req_ids[i1], self._req_ids[i2] =\
             self._req_ids[i2], self._req_ids[i1] # noqa
         self.req_output_token_ids[i1], self.req_output_token_ids[i2] =\
             self.req_output_token_ids[i2], self.req_output_token_ids[i1]
-        self.req_id_to_index[i1], self.req_id_to_index[i2] =\
-            self.req_id_to_index[i2], self.req_id_to_index[i1]
+        if old_id_i1 is not None and old_id_i2 is not None:
+            self.req_id_to_index[old_id_i1], self.req_id_to_index[old_id_i2] =\
+                self.req_id_to_index[old_id_i2], self.req_id_to_index[old_id_i1]
         self.num_tokens[i1], self.num_tokens[i2] =\
             self.num_tokens[i2], self.num_tokens[i1]
         self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\

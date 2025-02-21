@@ -578,7 +578,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # from these partial requests, we do so for simplicity.
             # We will ignore the sampled tokens from the partial requests.
             # TODO: Support prompt logprobs.
-            logits_indices = query_start_loc[1:] - 1
+            logits_indices = attn_metadata.query_start_loc[1:] - 1
 
         # Hot-Swap lora model
         if self.lora_config:

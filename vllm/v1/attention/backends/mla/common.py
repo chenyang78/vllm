@@ -235,6 +235,7 @@ except ImportError:
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler_output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 class MLACommonBackend(AttentionBackend):
@@ -298,10 +299,6 @@ class MLACommonMetadata:
 
     # The dimension of the attention heads
     head_dim: Optional[int] = None
-
-    # Used when chunked prefill is enabled to simulate worst case workspace
-    # allocations, hopefully to avoid going OOM
-    is_profile_run: bool = False
 
     # New for MLA (compared to FlashAttention)
     # For chunked prefill
@@ -409,8 +406,8 @@ class MLACommonMetadataBuilder:
             # If the decode is at the "back" of the batch, i, we can swap it
             # with the prefill closest to the front of the batch
             if decodes[num_decodes - i] >= num_decodes:
-                input_batch.swap(prefills[first_prefill],
-                                 decodes[num_decodes - i])
+                input_batch.swap_states(prefills[first_prefill],
+                                        decodes[num_decodes - i])
                 first_prefill += 1
 
         # Save for next `build` call
@@ -423,17 +420,18 @@ class MLACommonMetadataBuilder:
 
     def build(self, num_reqs: int, num_actual_tokens: int, max_query_len: int,
               common_prefix_len: int):
+        device = self.runner.device
         max_seq_len = self.runner.seq_lens_np[:num_reqs].max()
         query_start_loc = self.runner.query_start_loc_cpu[:num_reqs + 1].to(
-            self.runner.device, non_blocking=True)
-        seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(self.runner.device,
+            device, non_blocking=True)
+        seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(device,
                                                           non_blocking=True)
         block_table = (self.runner.input_batch.block_table.get_device_tensor()
                        [:num_reqs]),
         slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
-            self.runner.device, non_blocking=True).long()
+            device, non_blocking=True).long()
         input_positions = self.runner.positions_cpu[:num_actual_tokens].to(
-            self.runner.device, non_blocking=True).long()
+            device, non_blocking=True).long()
 
         context_chunk_cu_seq_lens = None
         context_chunk_starts = None
@@ -444,7 +442,7 @@ class MLACommonMetadataBuilder:
         # but is this assumption right?
         num_computed_tokens_cpu = \
             self.runner.input_batch.num_computed_tokens_cpu[:num_reqs]
-        context_lens_tensor = num_computed_tokens_cpu.to(self.runner.device,
+        context_lens_tensor = num_computed_tokens_cpu.to(device,
                                                          non_blocking=True)
 
         num_prefills_with_context = \
@@ -501,7 +499,6 @@ class MLACommonMetadataBuilder:
             block_table=block_table,
             slot_mapping=slot_mapping,
             head_dim=self.runner.model_config.get_head_size(),
-            is_profile_run=self.runner.in_profile_run,
             # MLACommonMetadata Chunk prefill specific
             num_decodes=self._num_decodes,
             num_decodes_tokens=self._num_decodes_tokens,
@@ -804,7 +801,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
             ops.gather_cache(
                 src_cache=kv_c_and_k_pe_cache,
                 dst=workspace,
-                block_table=attn_metadata.block_tables,
+                block_table=attn_metadata.block_table,
                 cu_seq_lens=attn_metadata.context_chunk_cu_seq_lens[i],
                 batch_size=attn_metadata.num_prefills,
                 seq_starts=attn_metadata.context_chunk_starts[i],
@@ -945,29 +942,9 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
             # Profiling run.
             return output
 
-        if attn_metadata.is_profile_run and \
-            attn_metadata.chunked_prefill_workspace is not None:
-            # During the profile run try to simulate to worse case output size
-            # for `self.kv_b_proj(kv_c_normed)` in `_compute_prefill_context`
-            # since this can be large
-            raise RuntimeError("We are not supposed to get here!")
-            _ = torch.empty(
-                (attn_metadata.chunked_prefill_workspace.shape[0],
-                 self.num_heads, self.qk_nope_head_dim + self.v_head_dim),
-                device=k_c_normed.device,
-                dtype=k_c_normed.dtype,
-            )
-
         # Restore head dim (for rotary embedding)
         k_pe = k_pe.unsqueeze(1)
         assert hasattr(attn_metadata, "input_positions")
-
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        hs_or_q_c = hidden_states_or_q_c[:num_actual_tokens]
-        k_pe = k_pe[:num_actual_tokens]
-        input_positions = \
-            attn_metadata.input_positions[:num_actual_tokens]
-        k_c_normed = k_c_normed[:num_actual_tokens]
 
         assert attn_metadata.num_decodes is not None and \
             attn_metadata.num_prefills is not None and \
