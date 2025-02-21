@@ -194,11 +194,8 @@ return curr_o @ W_O
 
 import functools
 from abc import abstractmethod
-from collections import defaultdict
-from contextlib import contextmanager
 from dataclasses import dataclass
-from itertools import accumulate
-from typing import (Any, Dict, Generic, List, Optional, Tuple,
+from typing import (TYPE_CHECKING, Any, Dict, Generic, List, Optional, Tuple,
                     Type, TypeVar)
 
 import torch
@@ -208,12 +205,8 @@ from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionLayer,
                                               AttentionMetadata,
-                                              AttentionMetadataBuilder,
-                                              AttentionState, MLAAttentionImpl)
-from vllm.attention.backends.utils import (PAD_SLOT_ID, compute_slot_mapping,
-                                           compute_slot_mapping_start_idx,
-                                           get_flash_attn_version,
-                                           is_block_tables_empty)
+                                              MLAAttentionImpl)
+from vllm.attention.backends.utils import get_flash_attn_version
 from vllm.attention.ops.triton_merge_attn_states import merge_attn_states
 from vllm.distributed import (get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
@@ -231,15 +224,17 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     scaled_quantize)
 from vllm.model_executor.layers.rotary_embedding import (
     DeepseekScalingRotaryEmbedding, RotaryEmbedding)
-from vllm.multimodal import MultiModalPlaceholderMap
-from vllm.utils import async_tensor_h2d, cdiv, make_tensor_with_pad, round_down
-from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
+from vllm.utils import cdiv, round_down
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 except ImportError:
     # For rocm use upstream flash attention
     from flash_attn import flash_attn_varlen_func
+
+if TYPE_CHECKING:
+    from vllm.v1.core.scheduler_output import SchedulerOutput
+    from vllm.v1.worker.gpu_input_batch import InputBatch
 
 
 class MLACommonBackend(AttentionBackend):
@@ -310,6 +305,8 @@ class MLACommonMetadata:
 
     # New for MLA (compared to FlashAttention)
     # For chunked prefill
+    num_decodes: Optional[int] = None
+    num_decodes_tokens: Optional[int] = None
     num_prefills: Optional[int] = None
     context_chunk_cu_seq_lens: Optional[torch.Tensor] = None
     context_chunk_starts: Optional[torch.Tensor] = None
@@ -368,21 +365,76 @@ class MLACommonMetadataBuilder:
             )
             self.page_size = self.runner.block_size
 
-    def build(self, num_reqs: int, num_actual_tokens: int,
-              max_query_len: int, common_prefix_len: int):
+    def reorder_batch(self, input_batch: "InputBatch",
+                      scheduler_output: "SchedulerOutput"):
+        # We now want to reorder the batch so that the "decode" requests are and
+        # the front and the "prefill" requests are at the using the least amount
+        # swaps possible. (NOTE for now we loosely use "decode" to mean requests
+        # where attention is likely memory-bound and "prefill" to mean requests
+        # where attention is likely compute-bound, TODO(lucas): figure out a
+        # better naming here)
+        decodes = []
+        prefills = []
+        num_decodes_tokens = 0
+        num_prefill_tokens = 0
+
+        for i, req_id in enumerate(input_batch.req_ids):
+            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            # for now treat 1 scheduled token as "decode" even if its not,
+            # we should update this to something like < 8 in the future but
+            # currently the TritonMLA._forward_decode only supports
+            # num_tokens = 1
+            if num_tokens == 1:
+                decodes.append(i)
+                num_decodes_tokens += num_tokens
+            else:
+                prefills.append(i)
+                num_prefill_tokens += num_tokens
+
+        # We hope that this is fairly minimal since decodes
+        # should be around for a number of iterations so hopefully they are
+        # relatively stationary (and new request are generally appended to the
+        # persistent batch so already should be at the back)
+        # To achieve this we loop over the decodes in descending order and
+        # the prefills in ascending order. We swap decodes from the  "back"
+        # i.e. past where the last decode should be in the reodorered with
+        # prefills from the front of the batch.
+        # `decodes` and `prefills` are already in ascending order just based on
+        # the above loop
+        num_decodes = len(decodes)
+        num_prefills = len(prefills)
+        first_prefill = 0
+
+        for i in range(max(num_decodes, num_prefills)):
+            # If the decode is at the "back" of the batch, i, we can swap it
+            # with the prefill closest to the front of the batch
+            if decodes[num_decodes - i] >= num_decodes:
+                input_batch.swap(prefills[first_prefill],
+                                 decodes[num_decodes - i])
+                first_prefill += 1
+
+        # Save for next `build` call
+        # TODO(lucas): this is a bit of a hack, we should probably have a
+        # better way of doing this
+        self._num_decodes = num_decodes
+        self._num_prefills = num_prefills
+        self._num_decodes_tokens = num_decodes_tokens
+        self._num_prefill_tokens = num_prefill_tokens
+
+    def build(self, num_reqs: int, num_actual_tokens: int, max_query_len: int,
+              common_prefix_len: int):
         max_seq_len = self.runner.seq_lens_np[:num_reqs].max()
         query_start_loc = self.runner.query_start_loc_cpu[:num_reqs + 1].to(
             self.runner.device, non_blocking=True)
         seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(self.runner.device,
                                                           non_blocking=True)
-        block_table=(
-            self.runner.input_batch.block_table.get_device_tensor()[:num_reqs]),
+        block_table = (self.runner.input_batch.block_table.get_device_tensor()
+                       [:num_reqs]),
         slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
             self.runner.device, non_blocking=True).long()
         input_positions = self.runner.positions_cpu[:num_actual_tokens].to(
             self.runner.device, non_blocking=True).long()
 
-        num_prefills = None
         context_chunk_cu_seq_lens = None
         context_chunk_starts = None
         context_chunk_seq_tot = None
@@ -390,18 +442,18 @@ class MLACommonMetadataBuilder:
 
         # NOTE(yang): I assume that num_computed_tokens stands for context_lens,
         # but is this assumption right?
-        num_computed_tokens_cpu = self.runner.input_batch.num_computed_tokens_cpu[:num_reqs]
+        num_computed_tokens_cpu = \
+            self.runner.input_batch.num_computed_tokens_cpu[:num_reqs]
         context_lens_tensor = num_computed_tokens_cpu.to(self.runner.device,
                                                          non_blocking=True)
-        if self.chunked_prefill_enabled and context_lens_tensor.max() > 0:
 
-            num_prefills = num_reqs
+        num_prefills_with_context = \
+            (context_lens_tensor[self._num_decodes:] > 0).sum().item()
 
+        if num_prefills_with_context > 0:
             # NOTE: it is recommend you read the `Chunked Prefill` section in
             # the comment at the top of the file before trying to understand
             # the following code
-
-            num_prefills_with_context = (context_lens_tensor > 0).sum().item()
 
             # currently we allocate an equal amount of workspace for each
             # prefill in the batch, we could probably use a more advanced
@@ -424,7 +476,7 @@ class MLACommonMetadataBuilder:
                 torch.arange(num_chunks, device=device, dtype=torch.int32) \
                 .unsqueeze(1).expand(-1, num_reqs) \
                 * max_context_chunk
-            chunk_ends = torch.min(context_lens_tensor \
+            chunk_ends = torch.min(context_lens_tensor[self._num_decodes:] \
                 .unsqueeze(0), context_chunk_starts + max_context_chunk)
             chunk_seq_lens = (chunk_ends - context_chunk_starts).clamp(min=0)
             _context_chunk_cu_seq_lens = chunk_seq_lens.cumsum(dim=1).to(
@@ -451,7 +503,9 @@ class MLACommonMetadataBuilder:
             head_dim=self.runner.model_config.get_head_size(),
             is_profile_run=self.runner.in_profile_run,
             # MLACommonMetadata Chunk prefill specific
-            num_prefills=num_prefills,
+            num_decodes=self._num_decodes,
+            num_decodes_tokens=self._num_decodes_tokens,
+            num_prefills=self._num_prefills,
             context_chunk_cu_seq_lens=context_chunk_cu_seq_lens,
             context_chunk_starts=context_chunk_starts,
             context_chunk_seq_tot=context_chunk_seq_tot,
@@ -915,19 +969,38 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
             attn_metadata.input_positions[:num_actual_tokens]
         k_c_normed = k_c_normed[:num_actual_tokens]
 
-        # NOTE(yang): Is this the right approach to distinguishing
-        # "prefill" and "decode"?
-        is_compute_friendly = attn_metadata.max_seq_len == 1
-        if is_compute_friendly:
-            q = self.q_proj(hs_or_q_c)[0]\
-                .view(-1, self.num_heads, self.qk_head_dim)
-            q_pe = q[..., self.qk_nope_head_dim:]
-        else:
-            q_nope = self._q_proj_and_k_up_proj(hs_or_q_c)
-            q_pe = torch.matmul(hs_or_q_c, self.W_QR)\
-                .view(-1, self.num_heads, self.qk_rope_head_dim)
+        assert attn_metadata.num_decodes is not None and \
+            attn_metadata.num_prefills is not None and \
+            attn_metadata.num_decodes_tokens is not None
 
-        q_pe[...], k_pe[...] = self.rotary_emb(input_positions, q_pe, k_pe)
+        has_decode = attn_metadata.num_decodes > 0
+        has_prefill = attn_metadata.num_prefills > 0
+        num_decode_tokens = attn_metadata.num_decodes_tokens
+
+        decode_hs_or_q_c = hidden_states_or_q_c[:num_decode_tokens]
+        decode_k_pe = k_pe[:num_decode_tokens]
+        decode_input_positions = \
+            attn_metadata.input_positions[:num_decode_tokens]
+
+        prefill_hs_or_q_c = hidden_states_or_q_c[num_decode_tokens:]
+        prefill_k_pe = k_pe[num_decode_tokens:]
+        prefill_input_positions = \
+            attn_metadata.input_positions[num_decode_tokens:]
+        prefill_k_c_normed = k_c_normed[num_decode_tokens:]
+
+        if has_decode:
+            decode_q_nope = self._q_proj_and_k_up_proj(decode_hs_or_q_c)
+            decode_q_pe = torch.matmul(decode_hs_or_q_c, self.W_QR)\
+                .view(-1, self.num_heads, self.qk_rope_head_dim)
+            decode_q_pe[...], decode_k_pe[...] = self.rotary_emb(
+                decode_input_positions, decode_q_pe, decode_k_pe)
+
+        if has_prefill:
+            prefill_q = self.q_proj(prefill_hs_or_q_c)[0]\
+                .view(-1, self.num_heads, self.qk_head_dim)
+            prefill_q_pe = prefill_q[..., self.qk_nope_head_dim:]
+            prefill_q_pe[...], prefill_k_pe[...] = self.rotary_emb(
+                prefill_input_positions, prefill_q_pe, prefill_k_pe)
 
         # write the latent and rope to kv cache
         if kv_cache.numel() > 0:
@@ -940,13 +1013,17 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 scale=layer._k_scale,
             )
 
-        output = torch.empty(num_actual_tokens,
+        output = torch.empty(attn_metadata.num_actual_tokens,
                              self.o_proj.output_size,
                              device=hidden_states_or_q_c.device,
                              dtype=hidden_states_or_q_c.dtype)
-        if is_compute_friendly:
-            output = self._forward_prefill(q, k_c_normed, k_pe, kv_cache, attn_metadata)
-        else:
-            output = self._forward_decode(q_nope, q_pe, kv_cache, attn_metadata)
+        if has_prefill:
+            output[num_decode_tokens:] = self._forward_prefill(
+                prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
+                attn_metadata)
+
+        if has_decode:
+            output[:num_decode_tokens] = self._forward_decode(
+                decode_q_nope, decode_q_pe, kv_cache, attn_metadata)
 
         return output
