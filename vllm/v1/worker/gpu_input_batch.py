@@ -332,6 +332,47 @@ class InputBatch:
         self.logit_bias[req_index] = None
         return req_index
 
+    def swap_states(self, i1: str, i2: str) -> None:
+        self._req_ids[i1], self._req_ids[i2] =\ 
+            self._req_ids[i2], self._req_ids[i1] # noqa
+        self.req_output_token_ids[i1], self.req_output_token_ids[i2] =\
+            self.req_output_token_ids[i2], self.req_output_token_ids[i1]
+        self.req_id_to_index[i1], self.req_id_to_index[i2] =\
+            self.req_id_to_index[i2], self.req_id_to_index[i1]
+        self.num_tokens[i1], self.num_tokens[i2] =\
+            self.num_tokens[i2], self.num_tokens[i1]
+        self.token_ids_cpu[i1, ...], self.token_ids_cpu[i2, ...], =\
+            self.token_ids_cpu[i2, ...], self.token_ids_cpu[i1, ...]
+        self.num_tokens_no_spec[i1], self.num_tokens_no_spec[i2] =\
+            self.num_tokens_no_spec[i2], self.num_tokens_no_spec[i1]
+        self.num_prompt_tokens[i1], self.num_prompt_tokens[i2] =\
+            self.num_prompt_tokens[i2], self.num_prompt_tokens[i1]
+        self.num_computed_tokens_cpu[i1], self.num_computed_tokens_cpu[i2] =\
+            self.num_computed_tokens_cpu[i2], self.num_computed_tokens_cpu[i1]
+        self.temperature_cpu[i1], self.temperature_cpu[i2] =\
+            self.temperature_cpu[i2], self.temperature_cpu[i1]
+        self.top_p_cpu[i1], self.top_p_cpu[i2] =\
+            self.top_p_cpu[i2], self.top_p_cpu[i1]
+        self.top_k_cpu[i1], self.top_k_cpu[i2] =\
+            self.top_k_cpu[i2], self.top_k_cpu[i1]
+        self.frequency_penalties_cpu[i1], self.frequency_penalties_cpu[i2] =\
+            self.frequency_penalties_cpu[i2], self.frequency_penalties_cpu[i1]
+        self.presence_penalties_cpu[i1], self.presence_penalties_cpu[i2] =\
+            self.presence_penalties_cpu[i2], self.presence_penalties_cpu[i1]
+        self.repetition_penalties_cpu[i1], self.repetition_penalties_cpu[i2] =\
+            self.repetition_penalties_cpu[i2], self.repetition_penalties_cpu[i1]
+        self.min_p_cpu[i1], self.min_p_cpu[i2] =\
+            self.min_p_cpu[i2], self.min_p_cpu[i1]
+        self.generators[i1], self.generators[i2] =\
+            self.generators[i2], self.generators[i1]
+        self.min_tokens[i1], self.min_tokens[i2] =\
+            self.min_tokens[i2], self.min_tokens[i1]
+        self.request_lora_mapping[i1], self.request_lora_mapping[i2] =\
+            self.request_lora_mapping[i2], self.request_lora_mapping[i1]
+        self.logit_bias[i1], self.logit_bias[i2] =\
+            self.logit_bias[i2], self.logit_bias[i1]
+        self.block_table.swap_row(i1, i2)
+
     def condense(self, empty_req_indices: List[int]) -> None:
         num_reqs = self.num_reqs
         if num_reqs == 0:
