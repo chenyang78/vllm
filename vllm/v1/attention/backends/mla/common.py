@@ -410,7 +410,7 @@ class MLACommonMetadataBuilder:
         num_prefills = len(prefills)
         first_prefill = 0
 
-        for i in range(1, max(num_decodes, num_prefills) + 1):
+        for i in range(1, min(num_decodes, num_prefills) + 1):
             # If the decode is at the "back" of the batch, i, we can swap it
             # with the prefill closest to the front of the batch
             if decodes[num_decodes - i] >= num_decodes:
