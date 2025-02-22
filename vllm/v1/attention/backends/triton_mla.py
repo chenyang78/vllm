@@ -9,6 +9,8 @@ from vllm.attention.ops.triton_decode_attention import decode_attention_fwd
 from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
                                                    MLACommonImpl,
                                                    MLACommonMetadata)
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 
 class TritonMLABackend(MLACommonBackend):

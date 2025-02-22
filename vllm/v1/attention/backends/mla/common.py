@@ -437,7 +437,7 @@ class MLACommonMetadataBuilder:
         seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(device,
                                                           non_blocking=True)
         block_table = (self.runner.input_batch.block_table.get_device_tensor()
-                       [:num_reqs]),
+                       [:num_reqs])
         slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
             device, non_blocking=True).long()
         input_positions = self.runner.positions_cpu[:num_actual_tokens].to(
