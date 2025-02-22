@@ -5,10 +5,10 @@ from typing import Any, Dict, List, Optional, Type
 import torch
 
 from vllm.attention.backends.abstract import AttentionType
+from vllm.attention.ops.triton_decode_attention import decode_attention_fwd
 from vllm.v1.attention.backends.mla.common import (MLACommonBackend,
                                                    MLACommonImpl,
                                                    MLACommonMetadata)
-from vllm.attention.ops.triton_decode_attention import decode_attention_fwd
 
 
 class TritonMLABackend(MLACommonBackend):
@@ -101,8 +101,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         # Run MQA
         decode_attention_fwd(q, kv_c_and_k_pe_cache, kv_c_cache, o,
-                             attn_metadata.block_table,
-                             attn_metadata.seq_lens, attn_logits,
-                             num_kv_splits, self.scale, PAGE_SIZE)
+                             attn_metadata.block_table, attn_metadata.seq_lens,
+                             attn_logits, num_kv_splits, self.scale, PAGE_SIZE)
 
         return self._v_up_proj_and_o_proj(o)

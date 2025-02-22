@@ -210,6 +210,7 @@ from vllm.attention.backends.utils import get_flash_attn_version
 from vllm.attention.ops.triton_merge_attn_states import merge_attn_states
 from vllm.distributed import (get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                LinearBase, RowParallelLinear,
                                                UnquantizedLinearMethod)
@@ -236,6 +237,8 @@ if TYPE_CHECKING:
     from vllm.v1.core.scheduler_output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+logger = init_logger(__name__)
 
 
 class MLACommonBackend(AttentionBackend):
@@ -264,6 +267,10 @@ class MLACommonBackend(AttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> List[int]:
         return [576]
+
+    @staticmethod
+    def use_cascade_attention(*args, **kwargs) -> bool:
+        return False
 
 
 @dataclass
@@ -305,6 +312,7 @@ class MLACommonMetadata:
     num_decodes: Optional[int] = None
     num_decodes_tokens: Optional[int] = None
     num_prefills: Optional[int] = None
+    has_context: bool = False
     context_chunk_cu_seq_lens: Optional[torch.Tensor] = None
     context_chunk_starts: Optional[torch.Tensor] = None
     context_chunk_seq_tot: Optional[List[int]] = None
@@ -402,13 +410,15 @@ class MLACommonMetadataBuilder:
         num_prefills = len(prefills)
         first_prefill = 0
 
-        for i in range(max(num_decodes, num_prefills)):
+        for i in range(1, max(num_decodes, num_prefills) + 1):
             # If the decode is at the "back" of the batch, i, we can swap it
             # with the prefill closest to the front of the batch
             if decodes[num_decodes - i] >= num_decodes:
                 input_batch.swap_states(prefills[first_prefill],
                                         decodes[num_decodes - i])
                 first_prefill += 1
+            else:
+                break
 
         # Save for next `build` call
         # TODO(lucas): this is a bit of a hack, we should probably have a
@@ -440,18 +450,21 @@ class MLACommonMetadataBuilder:
 
         # NOTE(yang): I assume that num_computed_tokens stands for context_lens,
         # but is this assumption right?
-        num_computed_tokens_cpu = \
-            self.runner.input_batch.num_computed_tokens_cpu[:num_reqs]
-        context_lens_tensor = num_computed_tokens_cpu.to(device,
-                                                         non_blocking=True)
+        num_computed_tokens_cpu_tensor = \
+            self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
+        context_lens_tensor = \
+            num_computed_tokens_cpu_tensor.to(device, non_blocking=True)
 
-        num_prefills_with_context = \
-            (context_lens_tensor[self._num_decodes:] > 0).sum().item()
-
-        if num_prefills_with_context > 0:
+        if self.chunked_prefill_enabled and self._num_prefills > 0 \
+            and context_lens_tensor[self._num_decodes:].max() > 0:
             # NOTE: it is recommend you read the `Chunked Prefill` section in
             # the comment at the top of the file before trying to understand
             # the following code
+
+            self.has_context = True
+
+            num_prefills_with_context = \
+                (context_lens_tensor[self._num_decodes:] > 0).sum().item()
 
             # currently we allocate an equal amount of workspace for each
             # prefill in the batch, we could probably use a more advanced
@@ -866,8 +879,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
     ) -> torch.Tensor:
-
-        has_context = attn_metadata.num_prefills is not None
+        has_context = attn_metadata.has_context
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(\
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv_nope\
@@ -940,7 +952,7 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
 
         if attn_metadata is None:
             # Profiling run.
-            return output
+            return torch.zeros_like(hidden_states_or_q_c)
 
         # Restore head dim (for rotary embedding)
         k_pe = k_pe.unsqueeze(1)

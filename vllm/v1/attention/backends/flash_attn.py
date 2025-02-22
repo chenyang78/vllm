@@ -110,18 +110,17 @@ class FlashAttentionMetadataBuilder:
             self.runner.device, non_blocking=True)
         seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(self.runner.device,
                                                           non_blocking=True)
-        block_table = (self.runner.input_batch.block_table.get_device_tensor()
-                       [:num_reqs]),
+        block_table = (
+            self.runner.input_batch.block_table.get_device_tensor()[:num_reqs])
         slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
             self.runner.device, non_blocking=True).long()
 
         use_cascade = common_prefix_len > 0
         if use_cascade:
             # TODO: Optimize.
-            cu_prefix_query_lens = torch.tensor(
-                [0, num_actual_tokens],
-                dtype=torch.int32,
-                device=self.runner.device)
+            cu_prefix_query_lens = torch.tensor([0, num_actual_tokens],
+                                                dtype=torch.int32,
+                                                device=self.runner.device)
             prefix_kv_lens = torch.tensor([common_prefix_len],
                                           dtype=torch.int32,
                                           device=self.runner.device)
