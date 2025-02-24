@@ -243,6 +243,8 @@ logger = init_logger(__name__)
 
 class MLACommonBackend(AttentionBackend):
 
+    accept_output_buffer: bool = True
+
     @staticmethod
     def get_name() -> str:
         return "TRITON_MLA_VLLM_V1"
@@ -436,8 +438,8 @@ class MLACommonMetadataBuilder:
             device, non_blocking=True)
         seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(device,
                                                           non_blocking=True)
-        block_table = (self.runner.input_batch.block_table.get_device_tensor()
-                       [:num_reqs])
+        block_table = (
+            self.runner.input_batch.block_table.get_device_tensor()[:num_reqs])
         slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
             device, non_blocking=True).long()
         input_positions = self.runner.positions_cpu[:num_actual_tokens].to(
@@ -448,8 +450,6 @@ class MLACommonMetadataBuilder:
         context_chunk_seq_tot = None
         context_chunk_max_seq_lens = None
 
-        # NOTE(yang): I assume that num_computed_tokens stands for context_lens,
-        # but is this assumption right?
         num_computed_tokens_cpu_tensor = \
             self.runner.input_batch.num_computed_tokens_cpu_tensor[:num_reqs]
         context_lens_tensor = \
@@ -946,13 +946,12 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
         attn_metadata: T,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if output is not None:
-            raise NotImplementedError(
-                "output is not yet supported for MLAImplBase")
+
+        assert output is not None, "Output tensor must be provided."
 
         if attn_metadata is None:
             # Profiling run.
-            return torch.zeros_like(hidden_states_or_q_c)
+            return output
 
         # Restore head dim (for rotary embedding)
         k_pe = k_pe.unsqueeze(1)
@@ -1002,10 +1001,6 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
                 scale=layer._k_scale,
             )
 
-        output = torch.empty(attn_metadata.num_actual_tokens,
-                             self.o_proj.output_size,
-                             device=hidden_states_or_q_c.device,
-                             dtype=hidden_states_or_q_c.dtype)
         if has_prefill:
             output[num_decode_tokens:] = self._forward_prefill(
                 prefill_q, prefill_k_c_normed, prefill_k_pe, kv_cache,
