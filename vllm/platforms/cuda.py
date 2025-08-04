@@ -146,6 +146,7 @@ class CudaPlatformBase(Platform):
             # required block_size.
             use_flashmla = False
             use_cutlass_mla = False
+            use_tilelang_mla = False
 
             if envs.VLLM_ATTENTION_BACKEND is None:
                 # Default case
@@ -164,6 +165,8 @@ class CudaPlatformBase(Platform):
                 use_flashmla = (envs.VLLM_ATTENTION_BACKEND == "FLASHMLA")
                 use_cutlass_mla = (
                     envs.VLLM_ATTENTION_BACKEND == "CUTLASS_MLA")
+                use_tilelang_mla = (
+                    envs.VLLM_ATTENTION_BACKEND == "TILELANG_MLA_VLLM_V1")
 
             from vllm.attention.ops.flashmla import is_flashmla_supported
             if use_flashmla and is_flashmla_supported()[0] \
@@ -176,6 +179,22 @@ class CudaPlatformBase(Platform):
                 cache_config.block_size = 128
                 logger.info("Forcing kv cache block size to 128 for "
                             "CUTLASS_MLA backend.")
+
+            if use_tilelang_mla:
+                from vllm.attention.ops.tilelang_mla import (
+                    is_tilelang_mla_supported)
+                tile_lang_mla, tile_lang_mla_failure = \
+                    is_tilelang_mla_supported()
+                if tile_lang_mla:
+                    if cache_config.block_size < 64 or \
+                       cache_config.block_size % 64 != 0:
+                        cache_config.block_size = 64
+                        logger.info("Forcing kv cache block size to 64 for "
+                                    "TILELANG_MLA_VLLM_V1 backend.")
+                else:
+                    raise NotImplementedError(
+                        "tile_lang_mla is not supported: "
+                        f"{tile_lang_mla_failure}")
 
         # lazy import to avoid circular import
         from vllm.config import CUDAGraphMode
@@ -233,6 +252,15 @@ class CudaPlatformBase(Platform):
                 else:
                     logger.warning(
                         "Cutlass MLA backend is only supported on V1 engine")
+            if selected_backend == _Backend.TILELANG_MLA_VLLM_V1:
+                if use_v1:
+                    logger.info_once(
+                        "Using TileLang MLA backend on V1 engine.")
+                    return ("vllm.v1.attention.backends.mla."
+                            "tilelang_mla.TileLangMLABackend")
+                else:
+                    logger.warning(
+                        "TileLang MLA backend is only supported on V1 engine")
             if selected_backend == _Backend.TRITON_MLA or block_size != 64:
                 if use_v1:
                     logger.info_once("Using Triton MLA backend on V1 engine.")
