@@ -84,9 +84,9 @@ class TileLangMLAMetadataBuilder(MLACommonMetadataBuilder[TileLangMLAMetadata]
                 f"TileLangMLAImpl does not support {dtype} yet.")
 
         # heuristics from TileLang's example
-        self.num_kv_splits = 1
+        self.num_kv_splits = 4
         BLOCK_N = 64
-        BLOCK_H = self.num_heads // num_heads_kv
+        BLOCK_H = min(64, self.num_heads // num_heads_kv)
 
         max_seqlen = self.model_config.max_model_len
         max_seqlen_pad = math.ceil(max_seqlen / 256) * 256
@@ -165,12 +165,12 @@ class TileLangMLAImpl(MLACommonImpl[MLACommonMetadata]):
         if self.kv_cache_dtype.startswith("fp8"):
             raise NotImplementedError("FP8 TileLang MLA not yet supported")
 
-        q_nope = q_nope.contiguous()
-        q_pe = q_pe.contiguous()
+        q = torch.cat([q_nope, q_pe], dim=-1)  # [B, h_q, dv + dpe]
+
         B = q_nope.shape[0]
         dtype = q_nope.dtype
         device = q_nope.device
-        output_partial = torch.zeros(B,
+        output_partial = torch.empty(B,
                                      self.num_heads,
                                      attn_metadata.decode.num_kv_splits,
                                      self.kv_lora_rank,
@@ -182,16 +182,12 @@ class TileLangMLAImpl(MLACommonImpl[MLACommonMetadata]):
                            dtype=dtype,
                            device=device)
 
-        kv_c_cache = kv_c_and_k_pe_cache[..., :self.kv_lora_rank].contiguous()
-        kv_pe_cache = kv_c_and_k_pe_cache[..., self.kv_lora_rank:].contiguous()
-        rope_head_dim = kv_pe_cache.size(-1)
+        head_dim = kv_c_and_k_pe_cache.size(-1)  # nope + rope
 
         # Run TileLang FlashMLA
         mla_decoder = attn_metadata.decode.mla_decoder_kernel
         output = mla_decoder(
-            q_nope, q_pe,
-            kv_c_cache.view(-1, self.num_kv_heads, self.kv_lora_rank),
-            kv_pe_cache.view(-1, self.num_kv_heads,
-                             rope_head_dim), attn_metadata.decode.block_table,
-            attn_metadata.decode.seq_lens, glse, output_partial)
+            q, kv_c_and_k_pe_cache.view(-1, self.num_kv_heads, head_dim),
+            attn_metadata.decode.block_table, attn_metadata.decode.seq_lens,
+            glse, output_partial)
         return self._v_up_proj(output)
