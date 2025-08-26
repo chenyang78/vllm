@@ -11,6 +11,7 @@ from vllm.model_executor.layers.fused_moe.modular_kernel import (
     FusedMoEActivationFormat, FusedMoEPermuteExpertsUnpermute,
     FusedMoEPrepareAndFinalize)
 from vllm.triton_utils import HAS_TRITON
+from vllm.utils import has_tilelang
 
 _config: Optional[dict[str, Any]] = None
 
@@ -78,3 +79,7 @@ if HAS_TRITON:
         "TritonOrDeepGemmExperts",
         "BatchedTritonOrDeepGemmExperts",
     ]
+
+if has_tilelang:
+    # import to register the custom ops
+    import vllm.model_executor.layers.fused_moe.fused_tilelang_moe  # noqa

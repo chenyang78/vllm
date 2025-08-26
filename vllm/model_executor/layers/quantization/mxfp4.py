@@ -25,8 +25,8 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
-from vllm.utils import (has_triton_kernels, is_torch_equal_or_newer,
-                        next_power_of_2, round_up)
+from vllm.utils import (has_tilelang, has_triton_kernels,
+                        is_torch_equal_or_newer, next_power_of_2, round_up)
 from vllm.utils.flashinfer import has_flashinfer
 
 logger = init_logger(__name__)
@@ -113,6 +113,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.topk_indices_dtype = None
         self.moe = moe
         self.use_marlin = self._should_use_marlin()
+        self.use_tilelang = self._should_use_tilelang()
 
         if current_platform.is_device_capability(100) and not has_flashinfer():
             logger.warning_once(
@@ -133,6 +134,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             if not is_torch_equal_or_newer("2.8.0"):
                 return True
         return False
+
+    def _should_use_tilelang(self):
+        # Only enable TileLang if the user explicitly says so.
+        if envs.VLLM_MXFP4_USE_TILELANG is None:
+            return False
+        if not envs.VLLM_MXFP4_USE_TILELANG:
+            return False
+
+        if self.moe.use_ep:
+            raise NotImplementedError(
+                "EP is not supported TileLang mxfp4 moe yet")
+        # FIXME: allow tilelang kernels for CUDA sm_90 only at the moment.
+        # Will evaluate it for other CUDA arches and ROCm later.
+        if not (current_platform.is_cuda() and \
+                current_platform.is_device_capability(90)):
+            raise NotImplementedError(
+                "TileLang is not implemented for this platform yet")
+        _has_tilelang = has_tilelang()
+        if not _has_tilelang:
+            raise RuntimeError(
+                "tilelang package is not available. Please install it by "\
+                "following the instructions provided at "\
+                "https://github.com/tile-ai/tilelang.")
+        return True
 
     def create_weights(self, layer: torch.nn.Module, num_experts: int,
                        hidden_size: int, intermediate_size_per_partition: int,
@@ -262,6 +287,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     def process_weights_after_loading(self, layer):
         if self.use_marlin:
             prepare_moe_fp4_layer_for_marlin(layer)
+        elif self.use_tilelang:
+            logger.warning_once(
+                "Your GPU does not have native support for FP4 computation but "
+                "FP4 quantization is being used. Weight-only FP4 compression "
+                "will be used leveraging the TileLang kernel. This may degrade "
+                "performance for compute-heavy workloads.")
         elif should_use_flashinfer_mxfp4():
             from flashinfer import shuffle_matrix_a, shuffle_matrix_sf_a
             layer.gemm1_alpha = Parameter(torch.tensor(
@@ -551,6 +582,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 True,  # do finalize
             )[0]
             return trtllm_gen_output
+        elif self.use_tilelang:
+            assert x.dtype == torch.bfloat16
+            topk_weights, topk_ids = FusedMoE.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias)
+            return torch.ops.vllm.fused_tilelang_moe(
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_bias,
+                layer.w2_bias,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                quant_type_id=scalar_types.float4_e2m1f.id,
+                global_num_experts=global_num_experts,
+                activation=activation,
+            )
         else:
             return triton_kernel_moe_forward(
                 hidden_states=x,
